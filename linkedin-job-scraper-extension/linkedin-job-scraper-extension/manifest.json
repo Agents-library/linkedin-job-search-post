@@ -3,7 +3,7 @@
   "name": "LinkedIn Job Scraper",
   "version": "1.0.0",
   "description": "Automates LinkedIn job search and saves listing details to a Markdown file. For personal use with your own account.",
-  "permissions": ["storage", "downloads", "tabs", "scripting"],
+  "permissions": ["storage", "tabs", "scripting"],
   "host_permissions": ["https://www.linkedin.com/*"],
   "background": {
     "service_worker": "background.js"

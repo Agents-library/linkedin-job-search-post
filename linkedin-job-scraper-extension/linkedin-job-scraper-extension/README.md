@@ -2,7 +2,8 @@
 
 Opens a LinkedIn job search for you, walks through the results, and saves each
 listing's details (title, company, location, description, applicants, URL) to
-a Markdown file in your Downloads folder under `linkedin-jobs/`.
+a Markdown file in a folder you choose in the extension, named with today's
+date. Jobs already captured in the last 30 days are skipped.
 
 ## Read this before using it
 
@@ -37,10 +38,12 @@ a Markdown file in your Downloads folder under `linkedin-jobs/`.
 ## Usage
 
 1. Click the extension icon.
-2. Fill in **Keywords** (required) and **Location** (optional).
-3. Set **Max results** and the **delay range** (seconds between actions —
+2. Click **Choose** next to **Save folder** and pick where files should be
+   written. The extension remembers that folder. It does not use Downloads.
+3. Fill in **Keywords** (required) and **Location** (optional).
+4. Set **Max results** and the **delay range** (seconds between actions —
    defaults are 3–7s; don't set this near 0).
-4. Optionally set filters (same ones LinkedIn's own search bar offers):
+5. Optionally set filters (same ones LinkedIn's own search bar offers):
    - **Date posted** — any time / past 24h / past week / past month
    - **Experience level** — Internship, Entry level, Associate, Mid-Senior,
      Director, Executive (pick as many as you want)
@@ -55,14 +58,20 @@ a Markdown file in your Downloads folder under `linkedin-jobs/`.
 
    Click **Reset** next to "Filters" to clear all of the above back to
    defaults.
-5. Click **Start**. A new tab opens with the LinkedIn job search (filters
+6. Click **Start**. A new tab opens with the LinkedIn job search (filters
    already applied); leave it open and don't interact with it while the run
-   is in progress.
-6. Watch the popup for live progress (`Captured: N / max`). Click **Stop**
+   is in progress. After the last new listing on a page is captured, the run
+   opens the next page and continues until **Max results** is reached or
+   LinkedIn has no further pages.
+7. Watch the popup for live progress (`Captured: N / max`). Click **Stop**
    any time to end the run early — whatever was captured so far is still
    saved.
-7. When the run finishes (or you stop it), a Markdown file appears at
-   `Downloads/linkedin-jobs/linkedin-jobs-<timestamp>.md`.
+8. When the run finishes (or you stop it), `linkedin-jobs-<YYYY-MM-DD>.md`
+   is written in the folder you chose (a second run the same day is saved
+   alongside it, with a number added to the name). If Chrome needs permission
+   again, open the extension and click **Save**.
+   Listings captured in the last 30 days are not opened again and do not
+   count toward **Max results**.
 
 ## If it stops finding jobs (LinkedIn changed their layout)
 

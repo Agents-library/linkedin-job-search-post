@@ -17,6 +17,11 @@
   button { flex: 1; padding: 8px; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; }
   #start { background: #0a66c2; color: white; }
   #stop { background: #eee; color: #333; }
+  .folder-row { display: flex; gap: 8px; align-items: center; margin-top: 2px; }
+  .folder-row span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 6px; border: 1px solid #ccc; border-radius: 4px; background: #fafafa; }
+  #chooseFolder { flex: 0 0 auto; background: #eee; color: #333; padding: 6px 10px; }
+  #saveNow { display: none; width: 100%; margin-top: 8px; background: #0a66c2; color: white; }
+  #saveNow.visible { display: block; }
   #status { margin-top: 10px; font-size: 12px; color: #555; white-space: pre-line; min-height: 32px; }
   .warn { margin-top: 10px; font-size: 11px; color: #8a6d00; background: #fff8e1; border: 1px solid #ffe58f; border-radius: 4px; padding: 6px 8px; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
@@ -35,6 +40,13 @@
 
   <label for="location">Location</label>
   <input id="location" placeholder="e.g. Bengaluru, India">
+
+  <label>Save folder</label>
+  <div class="folder-row">
+    <span id="saveFolder">Not chosen</span>
+    <button type="button" id="chooseFolder">Choose</button>
+  </div>
+  <div class="hint">Pick where the Markdown file should be written. It is not saved to Downloads.</div>
 
   <div class="row">
     <div>
@@ -92,10 +104,12 @@
     <button id="stop">Stop</button>
   </div>
 
+  <button type="button" id="saveNow">Save</button>
   <div id="status">Idle.</div>
 
   <div class="warn">Runs against LinkedIn's own terms of service. Use your own account, stay well under the pacing you set here, and expect to stop immediately if LinkedIn shows a warning/checkpoint.</div>
 
+  <script src="save-folder.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

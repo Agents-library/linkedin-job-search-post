@@ -12,6 +12,9 @@ const els = {
   easyApply: document.getElementById('easyApply'),
   companyIds: document.getElementById('companyIds'),
   resetFilters: document.getElementById('resetFilters'),
+  saveFolder: document.getElementById('saveFolder'),
+  chooseFolder: document.getElementById('chooseFolder'),
+  saveNow: document.getElementById('saveNow'),
   start: document.getElementById('start'),
   stop: document.getElementById('stop'),
   status: document.getElementById('status'),
@@ -68,9 +71,28 @@ function currentSettings() {
   };
 }
 
+async function refreshFolderLabel() {
+  const { saveFolderName } = await chrome.storage.local.get('saveFolderName');
+  els.saveFolder.textContent = saveFolderName || 'Not chosen';
+}
+
+async function writePendingFile() {
+  const handle = await loadDirectoryHandle();
+  if (!handle) throw new Error('Choose a save folder first.');
+  const permission = await ensureWritePermission(handle, true);
+  if (permission !== 'granted') throw new Error('Folder access was not allowed.');
+  const pending = await loadPendingFile();
+  if (!pending || !pending.content) return '';
+  const written = await writeTextFile(handle, pending.filename, pending.content);
+  await clearPendingFile();
+  return written;
+}
+
 async function refreshStatus() {
   const { runState } = await chrome.storage.local.get('runState');
-  if (!runState || runState.phase === 'idle') {
+  const pending = await loadPendingFile().catch(() => null);
+  els.saveNow.classList.toggle('visible', !!(pending && pending.content) || !!(runState && runState.needsSave));
+  if (!runState || (runState.phase === 'idle' && !runState.message)) {
     els.status.textContent = 'Idle.';
     return;
   }
@@ -78,14 +100,58 @@ async function refreshStatus() {
     els.status.textContent = `Stopped: ${runState.message || 'error'}`;
     return;
   }
+  if (runState.phase === 'idle') {
+    els.status.textContent = `${runState.message}\nCaptured: ${runState.captured || 0}`;
+    return;
+  }
   els.status.textContent =
     `${runState.phase}\nCaptured: ${runState.captured || 0} / ${runState.maxResults || '?'}`;
 }
+
+els.chooseFolder.addEventListener('click', async () => {
+  try {
+    const handle = await window.showDirectoryPicker({ mode: 'readwrite', id: 'linkedin-job-scraper' });
+    await saveDirectoryHandle(handle);
+    els.saveFolder.textContent = handle.name;
+    const written = await writePendingFile();
+    els.status.textContent = written ? `Saved ${written}` : `Files will be saved to ${handle.name}.`;
+    if (written) els.saveNow.classList.remove('visible');
+  } catch (e) {
+    if (e && e.name === 'AbortError') return;
+    els.status.textContent = (e && e.message) || 'Could not use that folder.';
+  }
+});
+
+els.saveNow.addEventListener('click', async () => {
+  try {
+    const written = await writePendingFile();
+    els.saveNow.classList.remove('visible');
+    els.status.textContent = written ? `Saved ${written}` : 'Nothing waiting to save.';
+    if (written) {
+      const { runState } = await chrome.storage.local.get('runState');
+      await chrome.storage.local.set({
+        runState: { ...(runState || {}), phase: 'idle', needsSave: false, message: `Saved ${written}` },
+      });
+    }
+  } catch (e) {
+    els.status.textContent = (e && e.message) || 'Could not save the file.';
+  }
+});
 
 els.start.addEventListener('click', async () => {
   const settings = currentSettings();
   if (!settings.keywords) {
     els.status.textContent = 'Enter at least a keyword.';
+    return;
+  }
+  const handle = await loadDirectoryHandle();
+  if (!handle) {
+    els.status.textContent = 'Choose a save folder first.';
+    return;
+  }
+  const permission = await ensureWritePermission(handle, true);
+  if (permission !== 'granted') {
+    els.status.textContent = 'Allow access to the save folder to start.';
     return;
   }
   await chrome.storage.sync.set(settings);
@@ -107,5 +173,6 @@ els.resetFilters.addEventListener('click', () => {
 });
 
 loadSettings();
+refreshFolderLabel();
 refreshStatus();
 setInterval(refreshStatus, 1000);

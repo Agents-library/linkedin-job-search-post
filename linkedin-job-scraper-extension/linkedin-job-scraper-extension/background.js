@@ -1,10 +1,20 @@
 // background.js — MV3 service worker. Orchestrates a run: opens/points a tab at the
 // LinkedIn jobs search, tells the content script to start, buffers captured records,
-// and writes them out as a Markdown file when the run ends (or stops early).
+// and writes them out as a Markdown file in the folder chosen in the popup.
+
+importScripts('save-folder.js');
+
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 
 let activeTabId = null;
 let buffer = []; // captured job records for the current run
 let runSettings = null;
+let seenJobIds = new Set();
+let skipJobIds = new Set(); // job ids captured in the last 30 days
+let captureHistory = {}; // jobId -> captured-at epoch ms
+let historyWrite = Promise.resolve();
+let finishing = false;
+let stateReady = Promise.resolve();
 
 function buildSearchUrl(settings) {
   const params = new URLSearchParams({
@@ -42,150 +52,209 @@ async function setRunState(patch) {
   await chrome.storage.local.set({ runState: { ...(runState || {}), ...patch } });
 }
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === 'start-scrape') {
-    startRun(msg.settings);
-    sendResponse({ ok: true });
-  } else if (msg.type === 'stop-scrape') {
-    stopRun('stopped by user');
-    sendResponse({ ok: true });
-  } else if (msg.type === 'job-captured') {
-    buffer.push(msg.job);
-    setRunState({ captured: buffer.length });
-    if (runSettings && buffer.length >= runSettings.maxResults) {
-      finishRun('reached max results');
+function beginMessage() {
+  return {
+    type: 'begin',
+    settings: {
+      ...runSettings,
+      alreadyCaptured: buffer.length,
+      seenJobIds: [...seenJobIds],
+      skipJobIds: [...skipJobIds],
+    },
+  };
+}
+
+async function loadCaptureHistory() {
+  await historyWrite;
+  const stored = await chrome.storage.local.get('captureHistory');
+  const history = stored.captureHistory && typeof stored.captureHistory === 'object'
+    ? stored.captureHistory
+    : {};
+  const cutoff = Date.now() - THIRTY_DAYS_MS;
+  captureHistory = {};
+  skipJobIds = new Set();
+  for (const [id, at] of Object.entries(history)) {
+    if (typeof at === 'number' && at >= cutoff) {
+      captureHistory[id] = at;
+      skipJobIds.add(String(id));
     }
-  } else if (msg.type === 'scrape-progress') {
-    setRunState({ phase: msg.phase });
-  } else if (msg.type === 'scrape-done') {
-    finishRun(msg.reason || 'content script finished');
-  } else if (msg.type === 'scrape-error') {
-    finishRun(`error: ${msg.message}`, true);
   }
+  await chrome.storage.local.set({ captureHistory });
+}
+
+function rememberCapturedJob(jobId) {
+  if (!jobId) return;
+  const id = String(jobId);
+  captureHistory[id] = Date.now();
+  skipJobIds.add(id);
+  const snapshot = { ...captureHistory };
+  historyWrite = historyWrite
+    .then(() => chrome.storage.local.set({ captureHistory: snapshot }))
+    .catch(() => {});
+}
+
+function localDateStamp(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function sendBegin() {
+  if (!activeTabId || !runSettings || finishing) return;
+  if (buffer.length >= runSettings.maxResults) return;
+  chrome.tabs.sendMessage(activeTabId, beginMessage()).catch(() => {});
+}
+
+async function persistRun() {
+  if (!runSettings) {
+    await chrome.storage.session.remove('activeRun').catch(() => {});
+    return;
+  }
+  await chrome.storage.session.set({
+    activeRun: {
+      tabId: activeTabId,
+      settings: runSettings,
+      jobs: buffer,
+      seenJobIds: [...seenJobIds],
+    },
+  }).catch(() => {});
+}
+
+async function restoreRun() {
+  await loadCaptureHistory();
+  const { activeRun } = await chrome.storage.session.get('activeRun');
+  if (!activeRun || !activeRun.settings) return;
+  runSettings = activeRun.settings;
+  activeTabId = activeRun.tabId || null;
+  buffer = Array.isArray(activeRun.jobs) ? activeRun.jobs : [];
+  seenJobIds = new Set((activeRun.seenJobIds || []).map(String));
+}
+
+stateReady = restoreRun().then(() => {
+  if (runSettings && activeTabId) sendBegin();
+});
+
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.status !== 'complete') return;
+  stateReady.then(() => {
+    if (!runSettings || finishing || tabId !== activeTabId) return;
+    setTimeout(sendBegin, 1000);
+  });
+});
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  handleMessage(msg, sender).then(
+    () => sendResponse({ ok: true }),
+    (err) => sendResponse({ ok: false, error: String(err) })
+  );
   return true;
 });
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+async function handleMessage(msg, sender) {
+  await stateReady;
 
-function isJobsUrl(url) {
-  return typeof url === 'string' && /linkedin\.com\/jobs/i.test(url);
-}
-
-function isAuthWallUrl(url) {
-  return typeof url === 'string' && /linkedin\.com\/(login|checkpoint|authwall|uas\/login)/i.test(url);
-}
-
-async function pageReadyState(tabId) {
-  try {
-    const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => document.readyState,
-    });
-    return result || '';
-  } catch {
-    return '';
+  if (msg.type === 'start-scrape') {
+    await startRun(msg.settings);
+  } else if (msg.type === 'stop-scrape') {
+    await finishRun('stopped by user');
+  } else if (msg.type === 'content-ready') {
+    if (!runSettings || finishing || !sender.tab) return;
+    if (sender.tab.id !== activeTabId) return;
+    sendBegin();
+  } else if (msg.type === 'job-captured') {
+    if (!runSettings || finishing) return;
+    const job = msg.job || {};
+    const id = job.jobId ? String(job.jobId) : '';
+    if (id && seenJobIds.has(id)) return;
+    if (id) seenJobIds.add(id);
+    rememberCapturedJob(id);
+    buffer.push(job);
+    const captured = buffer.length;
+    const done = captured >= runSettings.maxResults;
+    setRunState({ captured });
+    await persistRun();
+    if (done) await finishRun('reached max results');
+  } else if (msg.type === 'scrape-progress') {
+    if (!runSettings || finishing) return;
+    setRunState({ phase: msg.phase });
+  } else if (msg.type === 'scrape-done') {
+    if (!runSettings) return;
+    await finishRun(msg.reason || 'content script finished');
+  } else if (msg.type === 'scrape-error') {
+    if (!runSettings) return;
+    await finishRun(`error: ${msg.message}`, true);
   }
-}
-
-// LinkedIn job search keeps the Chrome tab in "loading" almost forever (XHR,
-// websockets). Waiting for status === 'complete' is what caused the false
-// "did not finish loading" stop. Ready means: we are on a /jobs URL and the
-// document is at least interactive so the content script can run.
-async function waitForJobsTab(tabId, timeoutMs = 90000) {
-  const deadline = Date.now() + timeoutMs;
-  let sawJobsUrlAt = 0;
-
-  while (Date.now() < deadline) {
-    const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (!tab) throw new Error('search tab was closed');
-
-    if (isAuthWallUrl(tab.url)) {
-      throw new Error('LinkedIn asked for login or a checkpoint — sign in in that tab, then start again');
-    }
-
-    if (isJobsUrl(tab.url)) {
-      if (!sawJobsUrlAt) sawJobsUrlAt = Date.now();
-      const ready = await pageReadyState(tabId);
-      const documentReady = ready === 'interactive' || ready === 'complete';
-      const urlStable = Date.now() - sawJobsUrlAt >= 1500;
-      if (documentReady || urlStable || tab.status === 'complete') {
-        return tab;
-      }
-    }
-
-    await sleep(400);
-  }
-  throw new Error('LinkedIn jobs page did not become reachable — keep the tab open and try again after it shows results');
-}
-
-async function beginOnTab(tabId, settings) {
-  let lastError = 'could not reach content script';
-  for (let attempt = 0; attempt < 20; attempt++) {
-    try {
-      await chrome.tabs.sendMessage(tabId, { type: 'begin', settings });
-      return;
-    } catch (e) {
-      lastError = e && e.message ? e.message : lastError;
-      try {
-        await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
-      } catch {
-        // Tab may still be navigating; retry.
-      }
-      await sleep(800);
-    }
-  }
-  throw new Error(`${lastError} — reload the extension and confirm you are logged into LinkedIn`);
 }
 
 async function startRun(settings) {
+  const saveDir = await loadDirectoryHandle();
+  const savePermission = await ensureWritePermission(saveDir, false);
+  if (!saveDir || savePermission !== 'granted') {
+    await setRunState({
+      phase: 'error',
+      message: 'Choose a save folder in the extension and allow access before starting.',
+      captured: 0,
+      maxResults: settings.maxResults,
+    });
+    return;
+  }
+
   buffer = [];
-  runSettings = settings;
+  seenJobIds = new Set();
   finishing = false;
+  await loadCaptureHistory();
+  runSettings = { ...settings, runId: Date.now() };
   await chrome.storage.local.set({
     runState: { phase: 'opening LinkedIn…', captured: 0, maxResults: settings.maxResults },
   });
 
-  const url = buildSearchUrl(settings);
+  const url = buildSearchUrl(runSettings);
   const tab = await chrome.tabs.create({ url, active: true });
   activeTabId = tab.id;
+  await persistRun();
 
-  try {
-    await setRunState({ phase: 'waiting for LinkedIn jobs page…' });
-    await waitForJobsTab(activeTabId);
-    await setRunState({ phase: 'starting scrape…' });
-    await sleep(800);
-    await beginOnTab(activeTabId, settings);
-    await setRunState({ phase: 'scraping…' });
-  } catch (e) {
-    finishRun(e.message || 'failed to start scrape', true);
-  }
+  // Content script signals readiness too. This covers a load that finished
+  // before that signal, and a service-worker restart mid-run.
+  setTimeout(sendBegin, 2000);
+  setTimeout(sendBegin, 5000);
 }
 
-function stopRun(reason) {
-  if (activeTabId) {
-    chrome.tabs.sendMessage(activeTabId, { type: 'stop' }).catch(() => {});
-  }
-  finishRun(reason);
-}
-
-let finishing = false;
 async function finishRun(reason, isError = false) {
   if (finishing) return;
   finishing = true;
 
-  await writeMarkdown(buffer, runSettings);
-  await setRunState({
-    phase: isError ? 'error' : 'idle',
-    message: reason,
-    captured: buffer.length,
-  });
-
-  activeTabId = null;
+  const jobs = buffer;
+  const settings = runSettings;
+  const tabId = activeTabId;
   buffer = [];
+  seenJobIds = new Set();
   runSettings = null;
-  finishing = false;
+  activeTabId = null;
+
+  if (tabId) {
+    chrome.tabs.sendMessage(tabId, { type: 'stop' }).catch(() => {});
+  }
+
+  let savedAs = '';
+  let saveError = '';
+  try {
+    savedAs = (await writeMarkdown(jobs, settings)) || '';
+    await chrome.storage.session.remove('activeRun').catch(() => {});
+  } catch (e) {
+    saveError = (e && e.message) || 'Could not save the file.';
+  }
+
+  try {
+    await setRunState({
+      phase: saveError || isError ? 'error' : 'idle',
+      message: saveError || (savedAs ? `${reason}. Saved ${savedAs}` : reason),
+      captured: jobs.length,
+      needsSave: !!saveError && jobs.length > 0,
+    });
+  } finally {
+    finishing = false;
+  }
 }
 
 function escapeMd(text) {
@@ -196,7 +265,6 @@ async function writeMarkdown(jobs, settings) {
   if (!jobs.length) return;
 
   const now = new Date();
-  const stamp = now.toISOString().replace(/[:.]/g, '-');
   const lines = [];
   lines.push(`# LinkedIn Job Search — ${settings ? settings.keywords : ''}${settings && settings.location ? ' — ' + settings.location : ''}`);
   lines.push('');
@@ -225,13 +293,26 @@ async function writeMarkdown(jobs, settings) {
   }
 
   const content = lines.join('\n');
-  const dataUrl = 'data:text/markdown;charset=utf-8,' + encodeURIComponent(content);
-  const filename = `linkedin-jobs/linkedin-jobs-${stamp}.md`;
+  const filename = `linkedin-jobs-${localDateStamp(now)}.md`;
+  const handle = await loadDirectoryHandle();
+  if (!handle) {
+    await storePendingFile(filename, content);
+    throw new Error('Choose a save folder in the extension, then click Save.');
+  }
 
-  await chrome.downloads.download({
-    url: dataUrl,
-    filename,
-    saveAs: false,
-    conflictAction: 'uniquify',
-  });
+  const permission = await ensureWritePermission(handle, false);
+  if (permission !== 'granted') {
+    await storePendingFile(filename, content);
+    throw new Error('Folder access needs approval. Open the extension and click Save.');
+  }
+
+  try {
+    const written = await writeTextFile(handle, filename, content);
+    await clearPendingFile();
+    return written;
+  } catch (e) {
+    await storePendingFile(filename, content);
+    const detail = (e && e.message) || 'Could not save the file.';
+    throw new Error(`${detail} Open the extension and click Save.`);
+  }
 }
